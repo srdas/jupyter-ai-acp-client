@@ -7,6 +7,7 @@ from jupyterlab_chat.models import NewMessage
 
 from .tool_call_renderer import (
     ToolCallState,
+    ensure_serializable,
     extract_diffs,
     update_tool_call_from_progress,
     update_tool_call_from_start,
@@ -105,6 +106,9 @@ class ToolCallManager:
             [loc.path for loc in update.locations] if update.locations else None
         )
         diffs = extract_diffs(update.content)
+
+        raw_input = ensure_serializable(update.raw_input)
+
         persona.log.info(
             f"tool_call_start: id={update.tool_call_id} title={update.title!r}"
             f" kind={kind_str} locations={locations_paths}"
@@ -117,6 +121,7 @@ class ToolCallManager:
             kind=kind_str,
             locations=locations_paths,
             diffs=diffs,
+            raw_input=raw_input,
         )
 
         self.get_or_create_message(session_id, persona)
@@ -128,12 +133,8 @@ class ToolCallManager:
         """Handle a ToolCallProgress event."""
         session = self._ensure_session(session_id)
 
-        # Convert raw_output to a serializable value
-        raw_output = update.raw_output
-        if raw_output is not None and not isinstance(
-            raw_output, (str, int, float, bool, list, dict)
-        ):
-            raw_output = str(raw_output)
+        raw_input = ensure_serializable(update.raw_input)
+        raw_output = ensure_serializable(update.raw_output)
 
         kind_str = update.kind if update.kind else None
         status_str = update.status if update.status else None
@@ -152,6 +153,7 @@ class ToolCallManager:
             title=update.title,
             kind=kind_str,
             status=status_str,
+            raw_input=raw_input,
             raw_output=raw_output,
             locations=locations_paths,
             diffs=diffs,

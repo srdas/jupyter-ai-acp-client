@@ -59,7 +59,7 @@ from asyncio.subprocess import Process
 
 from .terminal_manager import TerminalManager
 from .tool_call_manager import ToolCallManager
-from .tool_call_renderer import extract_diffs
+from .tool_call_renderer import ensure_serializable, extract_diffs
 from .permission_manager import PermissionManager
 
 import traceback as tb_mod
@@ -475,6 +475,10 @@ class JaiAcpClient(Client):
             tc.permission_options = permission_options
             tc.permission_status = "pending"
             tc.session_id = session_id
+
+            # Capture raw_input if not already set from ToolCallStart
+            if tool_call.raw_input is not None and tc.raw_input is None:
+                tc.raw_input = ensure_serializable(tool_call.raw_input)
 
             # Extract diffs from tool_call.content — agents may send
             # FileEditToolCallContent here rather than on ToolCallStart

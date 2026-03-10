@@ -13,6 +13,13 @@ from pydantic import BaseModel
 from acp.schema import PermissionOption, ContentToolCallContent, FileEditToolCallContent, TerminalToolCallContent
 
 
+def ensure_serializable(value: Optional[Any]) -> Optional[Any]:
+    """Convert non-JSON-serializable values to strings for Yjs transport."""
+    if value is not None and not isinstance(value, (str, int, float, bool, list, dict)):
+        return str(value)
+    return value
+
+
 @dataclass
 class ToolCallDiff:
     """A single file diff from an ACP tool call."""
@@ -27,6 +34,7 @@ class ToolCallState(BaseModel):
     title: str
     kind: Optional[str] = None
     status: Optional[str] = None
+    raw_input: Optional[Any] = None
     raw_output: Optional[Any] = None
     locations: Optional[list[str]] = None
     permission_options: Optional[list[PermissionOption]] = None
@@ -89,6 +97,7 @@ def update_tool_call_from_start(
     kind: Optional[str] = None,
     locations: Optional[list[str]] = None,
     diffs: Optional[list[ToolCallDiff]] = None,
+    raw_input: Optional[Any] = None,
 ) -> None:
     """
     Apply a ToolCallStart event to the tool calls dict.
@@ -108,6 +117,7 @@ def update_tool_call_from_start(
         title=title,
         kind=kind,
         status="in_progress",
+        raw_input=raw_input,
         locations=locations,
         diffs=diffs,
     )
@@ -119,6 +129,7 @@ def update_tool_call_from_progress(
     title: Optional[str] = None,
     kind: Optional[str] = None,
     status: Optional[str] = None,
+    raw_input: Optional[Any] = None,
     raw_output: Optional[Any] = None,
     locations: Optional[list[str]] = None,
     diffs: Optional[list[ToolCallDiff]] = None,
@@ -141,6 +152,7 @@ def update_tool_call_from_progress(
             title=resolved_title,
             kind=kind,
             status=status or "in_progress",
+            raw_input=raw_input,
             raw_output=raw_output,
             locations=locations,
             diffs=diffs,
@@ -155,6 +167,8 @@ def update_tool_call_from_progress(
     # "failed" is terminal: don't let late-arriving updates overwrite it
     if status is not None and tc.status != "failed":
         tc.status = status
+    if raw_input is not None:
+        tc.raw_input = raw_input
     if raw_output is not None:
         tc.raw_output = raw_output
     if locations is not None:
