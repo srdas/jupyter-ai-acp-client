@@ -1,9 +1,12 @@
+import asyncio
 import os
+import platform
 import re
 import shutil
 import subprocess
 
 from jupyter_ai_persona_manager import PersonaDefaults, PersonaRequirementsUnmet
+from jupyterlab_chat.models import Message
 from ..base_acp_persona import BaseAcpPersona
 
 # Raise `PersonaRequirementsUnmet` if `kiro-cli` not installed
@@ -68,9 +71,11 @@ except FileNotFoundError:
     )
 
 class KiroAcpPersona(BaseAcpPersona):
+    _terminal_opened: bool
     def __init__(self, *args, **kwargs):
         executable = ["kiro-cli", "acp"]
         super().__init__(*args, executable=executable, **kwargs)
+        self._terminal_opened = False
     
     @property
     def defaults(self) -> PersonaDefaults:
@@ -84,3 +89,100 @@ class KiroAcpPersona(BaseAcpPersona):
             avatar_path=avatar_path,
             system_prompt="unused"
         )
+    
+    async def before_agent_subprocess(self) -> None:
+        # The Kiro ACP agent subprocess fails to start if the user is not signed
+        # in. Therefore we must implement this method to wait until the user is
+        # signed in. The ACP agent server does not start until this is complete.
+        failed_auth_check = False
+        while True:
+            # If authenticated with Kiro, return
+            if await self._check_kiro_auth():
+                break
+
+            # Reaching here := user is not signed in
+            if not failed_auth_check:
+                self.log.info("[Kiro] User is not signed in.")
+                failed_auth_check = True
+
+            # Re-check every 2 seconds
+            await asyncio.sleep(2)
+        
+        # Reaching this point := user is authenticated
+        self.log.info("[Kiro] User is signed in.")
+
+        # If initially signed out, send a message letting the user know they are
+        # now signed in.
+        if failed_auth_check:
+            self.send_message("Thanks for signing in! I'm ready to help.")
+    
+    async def is_authed(self) -> bool:
+        # In Kiro, the user remains signed in even if they sign out while the
+        # ACP agent server is running. Therefore we can just return the status
+        # of the `before_agent_subprocess()` task to check if the user is
+        # authenticated.
+        return self._before_subprocess_future.done()
+    
+    async def handle_no_auth(self, message: Message) -> None:
+        # Determine which command to show
+        use_device_flow = await self._should_use_device_flow()
+        command = "kiro-cli login --use-device-flow" if use_device_flow else "kiro-cli login"
+        
+        # Return canned reply with appropriate command
+        self.send_message(f"You're not signed in to Kiro yet. Please run `{command}` in a terminal to sign in.")
+
+        # Open the terminal to help the user login
+        if not self._terminal_opened:
+            self._terminal_opened = await self._open_kiro_login_terminal()
+            if self._terminal_opened:
+                self.send_message("I've opened a new terminal to help with that.")
+
+    async def _check_kiro_auth(self) -> bool:
+        """
+        Helper method that checks if the client is authenticated with Kiro.
+        """
+        process = await asyncio.create_subprocess_exec(
+            "kiro-cli", "whoami",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await process.wait()
+        return process.returncode == 0
+    
+    async def _should_use_device_flow(self) -> bool:
+        """Check if device flow should be used on Linux."""
+        try:
+            if platform.system() != 'Linux':
+                return False
+            
+            # Check SSH
+            if any(var in os.environ for var in ['SSH_CLIENT', 'SSH_CONNECTION', 'SSH_TTY']):
+                return True
+            
+            # Check WSL
+            try:
+                with open('/proc/sys/kernel/osrelease', 'r') as f:
+                    if any(x in f.read().lower() for x in ['microsoft', 'wsl']):
+                        return not shutil.which('wslview')
+            except:
+                pass
+            
+            # Check xdg-open
+            return not shutil.which('xdg-open')
+        except Exception as e:
+            self.log.warning(f"[Kiro] Error detecting device flow requirement: {e}")
+            return False
+    
+    async def _open_kiro_login_terminal(self) -> bool:
+        """
+        Attempt to open a terminal to log in with Kiro.
+
+        Returns `True` if successful, `False` otherwise.
+        """
+        try:
+            from jupyterlab_commands_toolkit.tools import execute_command
+        except Exception:
+            return False
+
+        response = await execute_command("terminal:create-new")
+        return response.get("success", False)

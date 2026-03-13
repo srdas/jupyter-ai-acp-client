@@ -74,3 +74,38 @@ export async function getAcpSlashCommands(
 
   return response.commands;
 }
+/**
+ * Send the user's permission decision to the backend.
+ */
+export async function submitPermissionDecision(
+  sessionId: string,
+  toolCallId: string,
+  optionId: string
+): Promise<void> {
+  await requestAPI('/permissions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      session_id: sessionId,
+      tool_call_id: toolCallId,
+      option_id: optionId
+    })
+  });
+}
+
+export async function stopStreaming(
+  chatPath: string,
+  personaMentionName: string | null = null
+): Promise<void> {
+  try {
+    if (personaMentionName === null) {
+      await requestAPI(`/stop?chat_path=${chatPath}`, { method: 'POST' });
+    } else {
+      await requestAPI(`/stop/${personaMentionName}?chat_path=${chatPath}`, {
+        method: 'POST'
+      });
+    }
+  } catch (e) {
+    console.warn('Error stopping stream: ', e);
+  }
+}

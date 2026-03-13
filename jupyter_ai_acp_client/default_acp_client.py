@@ -1,20 +1,21 @@
 import asyncio
-import contextlib
 import logging
 import os
-import sys
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, Awaitable
+from time import time
+
+log = logging.getLogger(__name__)
 
 from acp import (
     PROTOCOL_VERSION,
     Client,
     RequestError,
     connect_to_agent,
-    text_block,
 )
 from acp.core import ClientSideConnection
 from acp.schema import (
+    AgentCapabilities,
     AgentMessageChunk,
     AgentPlanUpdate,
     AgentThoughtChunk,
@@ -27,8 +28,10 @@ from acp.schema import (
     EnvVariable,
     FileSystemCapability,
     ImageContentBlock,
+    InitializeResponse,
     Implementation,
     KillTerminalCommandResponse,
+    LoadSessionResponse,
     NewSessionResponse,
     PermissionOption,
     PromptResponse,
@@ -44,21 +47,22 @@ from acp.schema import (
     UserMessageChunk,
     WaitForTerminalExitResponse,
     WriteTextFileResponse,
-    AllowedOutcome
+    McpServerStdio as AcpMcpServerStdio,
+    HttpMcpServer as AcpMcpServerHttp,
+    AllowedOutcome,
+    DeniedOutcome
 )
-from jupyter_ai_persona_manager import BasePersona
-from typing import Awaitable
+from jupyter_ai_persona_manager import BasePersona, McpServerStdio
+from jupyterlab_chat.models import Message
+from jupyterlab_chat.utils import find_mentions
 from asyncio.subprocess import Process
 
 from .terminal_manager import TerminalManager
+from .tool_call_manager import ToolCallManager
+from .tool_call_renderer import ensure_serializable, extract_diffs
+from .permission_manager import PermissionManager
 
-async def queue_to_iterator(queue: asyncio.Queue[str], sentinel: str = "__end__") -> AsyncIterator[str]:
-    """Convert an asyncio queue to an async iterator."""
-    while True:
-        item = await queue.get()
-        if item == sentinel:
-            break
-        yield item
+import traceback as tb_mod
 
 class JaiAcpClient(Client):
     """
@@ -68,13 +72,26 @@ class JaiAcpClient(Client):
     """
 
     agent_subprocess: Process
-    _connection_future: Awaitable[ClientSideConnection]
+    _connection_future: Awaitable[tuple[ClientSideConnection, InitializeResponse]]
     event_loop: asyncio.AbstractEventLoop
     _personas_by_session: dict[str, BasePersona]
-    _queues_by_session: dict[str, asyncio.Queue[str]]
     _terminal_manager: TerminalManager
+    _tool_call_manager: ToolCallManager
+    _prompt_locks_by_session: dict[str, asyncio.Lock]
+    _loading_sessions: dict[str, asyncio.Task[LoadSessionResponse]]
+    """
+    Maps session IDs to their in-flight or completed load tasks. Subsequent
+    calls to `load_session()` for the same session await the existing task
+    instead of issuing duplicate requests.
+    """
 
-    def __init__(self, *args, agent_subprocess: Awaitable[Process], event_loop: asyncio.AbstractEventLoop, **kwargs):
+    def __init__(
+            self,
+            *args,
+            agent_subprocess: Awaitable[Process],
+            event_loop: asyncio.AbstractEventLoop,
+            **kwargs,
+    ):
         """
         :param agent_subprocess: The ACP agent subprocess
         (`asyncio.subprocess.Process`) assigned to this client.
@@ -89,15 +106,19 @@ class JaiAcpClient(Client):
         self.event_loop = event_loop
         # Each client instance maintains its own session mappings
         self._personas_by_session = {}
-        self._queues_by_session = {}
+        self._prompt_locks_by_session: dict[str, asyncio.Lock] = {}
         self._terminal_manager = TerminalManager(event_loop)
+        self._tool_call_manager = ToolCallManager()
+        self._permission_manager = PermissionManager(event_loop)
+        self._loading_sessions: dict[str, asyncio.Task[LoadSessionResponse]] = {}
         super().__init__(*args, **kwargs)
-    
+        self._cancel_requested: dict[str, bool] = {}
 
-    async def _init_connection(self) -> ClientSideConnection:
+
+    async def _init_connection(self) -> tuple[ClientSideConnection, InitializeResponse]:
         proc = self.agent_subprocess
         conn = connect_to_agent(self, proc.stdin, proc.stdout)
-        await conn.initialize(
+        init_response = await conn.initialize(
             protocol_version=PROTOCOL_VERSION,
             client_capabilities=ClientCapabilities(
                 fs=FileSystemCapability(read_text_file=True, write_text_file=True),
@@ -105,96 +126,209 @@ class JaiAcpClient(Client):
             ),
             client_info=Implementation(name="Jupyter AI", title="Jupyter AI ACP Client", version="0.1.0"),
         )
-        return conn
-    
+        return conn, init_response
+
     async def get_connection(self) -> ClientSideConnection:
-        return await self._connection_future
+        conn, _ = await self._connection_future
+        return conn
+
+    async def get_agent_capabilities(self) -> AgentCapabilities:
+        _, init_response = await self._connection_future
+        # the ACP SDK annotates that this type may be `None`, but that is not
+        # true. the Pydantic model they define sets an empty `AgentCapabilities`
+        # object as a default if this is not included in the response from the
+        # agent.
+        #
+        # See: https://github.com/agentclientprotocol/python-sdk/pull/78
+        return init_response.agent_capabilities
+
+    async def _get_mcp_servers(self, persona: BasePersona) -> list[AcpMcpServerStdio | AcpMcpServerHttp]:
+        agent_capabilities = await self.get_agent_capabilities()
+
+        # Parse stdio and HTTP MCP servers from `.jupyter/mcp_settings.json` and
+        # pass them to the ACP agent.
+        #
+        # We need to cast each from the PersonaManager model to the ACP model
+        # here. The models are the exact same, but we still need to do this to
+        # avoid a Pydantic error. 
+        mcp_settings = persona.get_mcp_settings()
+        mcp_servers: list[AcpMcpServerStdio | AcpMcpServerHttp] = []
+        if mcp_settings:
+            for mcp_server in mcp_settings.mcp_servers:
+                if isinstance(mcp_server, McpServerStdio):
+                    mcp_servers.append(AcpMcpServerStdio(**mcp_server.model_dump()))
+                # only append HTTP MCP servers if support is indicated in the
+                # agent capabilities returned on session init
+                elif agent_capabilities.mcp_capabilities.http:
+                    mcp_servers.append(AcpMcpServerHttp(**mcp_server.model_dump()))
+        
+        return mcp_servers
 
     async def create_session(self, persona: BasePersona) -> NewSessionResponse:
         """
         Create an ACP agent session through this client scoped to a
-        `BasePersona` instance.
+        `BasePersona` instance. Sends a `session/new` JSON-RPC message to the
+        ACP agent.
         """
         conn = await self.get_connection()
-        # TODO: change this to Jupyter preferred dir
-        session = await conn.new_session(mcp_servers=[], cwd=os.getcwd())
+        mcp_servers = await self._get_mcp_servers(persona)
+
+        # TODO: change this to chat parent dir
+        session = await conn.new_session(mcp_servers=mcp_servers, cwd=os.getcwd())
         self._personas_by_session[session.session_id] = persona
         return session
     
-    async def prompt_and_reply(self, session_id: str, prompt: str, attachments: list[dict] = []) -> PromptResponse:
+    def _is_session_loading(self, session_id: str) -> bool:
+        task = self._loading_sessions.get(session_id)
+        return task is not None and not task.done()
+
+    async def load_session(self, persona: BasePersona, session_id: str) -> LoadSessionResponse:
+        """
+        Load an existing ACP agent session through this client scoped to a
+        `BasePersona` instance. Sends a `session/load` JSON-RPC message to the
+        ACP agent.
+
+        This method is idempotent: concurrent or repeated calls for the same
+        session await the original task rather than issuing duplicate requests.
+
+        TODO: call `session/resume` if supported by the ACP agent, once the
+        below RFD is approved.
+        - https://agentclientprotocol.com/rfds/session-resume
+        """
+        if session_id in self._loading_sessions:
+            return await self._loading_sessions[session_id]
+
+        self._loading_sessions[session_id] = self.event_loop.create_task(
+            self._load_session_rpc(persona, session_id)
+        )
+        return await self._loading_sessions[session_id]
+
+    async def _load_session_rpc(self, persona: BasePersona, session_id: str) -> LoadSessionResponse:
+        """
+        Performs the actual `session/load` RPC call. Never call this method
+        directly, call `load_session()` instead.
+        """
+        conn = await self.get_connection()
+        mcp_servers = await self._get_mcp_servers(persona)
+        response = await conn.load_session(
+            cwd=os.getcwd(),
+            mcp_servers=mcp_servers,
+            session_id=session_id,
+        )
+        self._personas_by_session[session_id] = persona
+        return response
+
+    async def prompt_and_reply(
+        self,
+        session_id: str,
+        prompt: str,
+        attachments: list[dict] | None = None,
+        root_dir: str | None = None,
+    ) -> PromptResponse:
         """
         A helper method that sends a prompt with an optional list of attachments
         to the assigned ACP server. This method writes back to the chat by
-        calling methods on the persona corresponding to this session ID.
+        handling all events in session_update().
+
+        Attachments are plain dicts from ``YChat.get_attachments()``, keyed by
+        ``value`` (relative path), ``type`` (``"file"`` or ``"notebook"``), and
+        optionally ``mimetype``.  When *root_dir* is provided the relative path
+        is resolved to an absolute ``file://`` URI.
+
+        Uses a per-session lock to serialize concurrent calls, preventing
+        state corruption if multiple messages arrive before the first completes.
         """
         assert session_id in self._personas_by_session
-        conn = await self.get_connection()
+        lock = self._prompt_locks_by_session.setdefault(session_id, asyncio.Lock())
+        # Signal cancellation before cleanup so that any in-flight session_update 
+        # callbacks are suppressed and don't overwrite the failed status.
+        self._cancel_requested[session_id] = True
+        self._cancel_pending_work(session_id)
 
-        # ensure an asyncio Queue exists for this session
-        # the `session_update()` method will push chunks to this queue
-        queue = self._queues_by_session.get(session_id, None)
-        if queue is None:
-            queue: asyncio.Queue[str] = asyncio.Queue()
-            self._queues_by_session[session_id] = queue
+        async with lock:
+            self._cancel_requested[session_id] = False
+            conn = await self.get_connection()
+            persona = self._personas_by_session[session_id]
 
-        # create async iterator that yields until the response is complete
-        aiter = queue_to_iterator(queue)
+            # Reset session state for this prompt
+            self._tool_call_manager.reset(session_id)
 
-        # create background task to stream message back to client using the
-        # dedicated persona method
-        persona = self._personas_by_session[session_id]
-        self.event_loop.create_task(
-            persona.stream_message(aiter)
-        )
+            persona.log.info(f"prompt_and_reply: starting for session {session_id}")
 
-        # call the model and await
-        # TODO: add attachments!
-        response = await conn.prompt(
-            prompt=[
-                TextContentBlock(text=prompt, type="text"),
-            ],
-            session_id=session_id
-        )
+            # Set awareness to indicate writing
+            persona.awareness.set_local_state_field("isWriting", True)
 
-        # push sentinel value to queue to close the async iterator
-        queue.put_nowait("__end__")
+            try:
+                # Build content blocks: text prompt + optional attachment resources
+                content_blocks: list[TextContentBlock | ResourceContentBlock] = [
+                    TextContentBlock(text=prompt, type="text"),
+                ]
+                if attachments:
+                    for att in attachments:
+                        att_value = att.get("value", "")
+                        att_type = att.get("type", "file")
 
-        return response
+                        # Resolve to absolute file:// URI when root_dir is available
+                        if root_dir and att_value:
+                            abs_path = (Path(root_dir) / att_value).resolve()
+                            root_resolved = Path(root_dir).resolve()
+                            if not abs_path.is_relative_to(root_resolved):
+                                persona.log.warning(
+                                    "Attachment path %r escapes root_dir %r",
+                                    att_value,
+                                    root_dir,
+                                )
+                                uri = att_value
+                            else:
+                                uri = abs_path.as_uri()
+                        else:
+                            uri = att_value
 
-    async def session_update(
-        self,
-        session_id: str,
-        update: UserMessageChunk
-        | AgentMessageChunk
-        | AgentThoughtChunk
-        | ToolCallStart
-        | ToolCallProgress
-        | AgentPlanUpdate
-        | AvailableCommandsUpdate
-        | CurrentModeUpdate,
-        **kwargs: Any,
-    ) -> None:
-        """
-        Handles `session/update` requests from the ACP agent. There must be an
-        `asyncio.Queue` corresponding to this session ID - this should be set by
-        the `prompt_and_reply()` method.
-        """
+                        # Determine MIME type: explicit value or notebook default
+                        mime_type = att.get("mimetype")
+                        if mime_type is None and att_type == "notebook":
+                            mime_type = "application/x-ipynb+json"
 
-        if isinstance(update, AvailableCommandsUpdate):
-            if not update.available_commands:
-                return
-            persona = self._personas_by_session.get(session_id)
-            if persona and hasattr(persona, 'acp_slash_commands'):
-                persona.acp_slash_commands = update.available_commands
-            return
+                        content_blocks.append(
+                            ResourceContentBlock(
+                                uri=uri,
+                                name=Path(att_value).name if att_value else "<attachment>",
+                                type="resource_link",
+                                mime_type=mime_type,
+                            )
+                        )
 
-        if not isinstance(update, AgentMessageChunk):
-            return
+                # Call the model and await — session_update() handles all events
+                response = await conn.prompt(
+                    prompt=content_blocks,
+                    session_id=session_id,
+                )
 
-        if session_id not in self._queues_by_session:
-            logging.error(f"No queue found for session_id: {session_id}")
-            return
+                # If cancelled, message already finalized by stop_streaming()
+                if self._cancel_requested.get(session_id, False):
+                    return response
 
+                # Trigger find_mentions on the final message
+                message_id = self._tool_call_manager.get_message_id(session_id)
+                if message_id:
+                    msg = persona.ychat.get_message(message_id)
+                    if msg:
+                        persona.ychat.update_message(
+                            msg,
+                            trigger_actions=[find_mentions],
+                        )
+
+                persona.log.info(f"prompt_and_reply: completed for session {session_id}")
+                return response
+            except Exception:
+                persona.log.exception(f"prompt_and_reply: failed for session {session_id}")
+                raise
+            finally:
+                # Clear awareness writing state
+                persona.awareness.set_local_state_field("isWriting", False)
+
+    def _handle_agent_message_chunk(self, session_id: str, update: AgentMessageChunk) -> None:
+        """Handle an AgentMessageChunk event by appending text to the message."""
         content = update.content
         text: str
         if isinstance(content, TextContentBlock):
@@ -210,27 +344,171 @@ class JaiAcpClient(Client):
         else:
             text = "<content>"
 
-        queue = self._queues_by_session[session_id]
-        queue.put_nowait(text)
+        persona = self._personas_by_session.get(session_id)
+        if persona is None:
+            return
+        message_id = self._tool_call_manager.get_or_create_message(session_id, persona)
+        serialized_tool_calls = self._tool_call_manager.serialize(session_id)
+        persona.log.info(f"agent_message_chunk: {len(text)} chars, tool_calls={len(serialized_tool_calls)}")
+
+        msg = Message(
+            id=message_id,
+            body=text,
+            time=time(),
+            sender=persona.id,
+            raw_time=False,
+            metadata={"tool_calls": serialized_tool_calls},
+        )
+        persona.ychat.update_message(msg, append=True, trigger_actions=[])
+
+    async def session_update(
+        self,
+        session_id: str,
+        update: UserMessageChunk
+        | AgentMessageChunk
+        | AgentThoughtChunk
+        | ToolCallStart
+        | ToolCallProgress
+        | AgentPlanUpdate
+        | AvailableCommandsUpdate
+        | CurrentModeUpdate,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Handles `session/update` requests from the ACP agent. All event types
+        are handled directly here — tool calls, text chunks, and slash commands.
+        """
+        # ignore `session/update` messages received while a session is being
+        # loaded, since chat history is persisted on disk in Jupyter AI.
+        if self._is_session_loading(session_id):
+            return
+
+        persona = self._personas_by_session.get(session_id)
+        if persona:
+            persona.log.info(f"session_update: {type(update).__name__} for session {session_id}")
+
+        if isinstance(update, AvailableCommandsUpdate):
+            if not update.available_commands:
+                return
+            if persona and hasattr(persona, 'acp_slash_commands'):
+                persona.acp_slash_commands = update.available_commands
+            return
+
+        # Skip message/tool events when cancellation has been requested
+        if self._cancel_requested.get(session_id, False):
+            if isinstance(update, (ToolCallStart, ToolCallProgress)):
+                pass 
+            else:
+                return
+
+        if persona is None:
+            return
+
+        if isinstance(update, ToolCallStart):
+            self._tool_call_manager.handle_start(session_id, update, persona)
+            return
+
+        if isinstance(update, ToolCallProgress):
+            self._tool_call_manager.handle_progress(session_id, update, persona)
+            return
+
+        if isinstance(update, AgentMessageChunk):
+            self._handle_agent_message_chunk(session_id, update)
+            return
+    def includes_session(self, session_id: str) -> bool:
+        """Returns whether this client manages the given session."""
+        return session_id in self._personas_by_session
+
+    def resolve_permission(self, session_id: str, tool_call_id: str, option_id: str) -> bool:
+        """
+        Called by the REST endpoint when the user clicks a permission button.
+        Delegates to PermissionManager to resolve the pending Future.
+        """
+        return self._permission_manager.resolve(session_id, tool_call_id, option_id)
+
+    def list_sessions(self) -> list[str]:
+        """Returns the list of active session IDs managed by this client."""
+        return list(self._personas_by_session.keys())
 
     async def request_permission(
         self, options: list[PermissionOption], session_id: str, tool_call: ToolCall, **kwargs: Any
     ) -> RequestPermissionResponse:
         """
         Handles `session/request_permission` requests from the ACP agent.
-
-        TODO: This currently always gives the agent permission. We will need to
-        add some tool call approval UI and handle permission requests properly.
         """
-        option_id = ""
-        for o in options:
-            if "allow" in o.option_id.lower():
-                option_id = o.option_id
-                break
+        persona = self._personas_by_session.get(session_id)
+        if persona is None:
+            raise RuntimeError(
+                f"request_permission called without an initialized session: {session_id}"
+            )
 
-        return RequestPermissionResponse(
-            outcome=AllowedOutcome(option_id=option_id, outcome='selected')
-        )
+        try:
+            persona.log.info(
+                f"request_permission: CALLED session={session_id} "
+                f"tool_call_id={tool_call.tool_call_id} "
+                f"options_count={len(options)} "
+                f"options={[{'id': o.option_id, 'name': o.name, 'kind': o.kind} for o in options]} "
+                f"persona_class={persona.__class__.__name__}"
+            )
+
+            permission_options = list(options)
+
+            future = self._permission_manager.create_request(
+                session_id, tool_call.tool_call_id, options=permission_options
+            )
+
+            persona.log.info(
+                f"request_permission: {len(permission_options)} permission_options"
+            )
+
+            # Set the permission options + pending status on the tool call state,
+            # then flush to Yjs so the frontend renders the buttons.
+            session_state = self._tool_call_manager._ensure_session(session_id)
+            tc = session_state.tool_calls.get(tool_call.tool_call_id)
+            if tc is None:
+                persona.log.warning(
+                    f"request_permission: tool_call_id={tool_call.tool_call_id} not found in session {session_id}"
+                )
+                raise RequestError.invalid_params(
+                    {"tool_call_id": f"Unknown tool_call_id: {tool_call.tool_call_id}"}
+                )
+            tc.permission_options = permission_options
+            tc.permission_status = "pending"
+            tc.session_id = session_id
+
+            # Capture raw_input if not already set from ToolCallStart
+            if tool_call.raw_input is not None and tc.raw_input is None:
+                tc.raw_input = ensure_serializable(tool_call.raw_input)
+
+            # Extract diffs from tool_call.content — agents may send
+            # FileEditToolCallContent here rather than on ToolCallStart
+            diffs = extract_diffs(tool_call.content)
+            if diffs:
+                tc.diffs = diffs
+
+            self._tool_call_manager.get_or_create_message(session_id, persona)
+            self._tool_call_manager._flush_to_message(session_id, persona)  # Yjs sync and re-renders with the buttons
+
+            # Suspend until the user clicks a permission button
+            selected_option_id = await future
+
+            if selected_option_id is None:
+                tc.permission_status = "resolved"
+                self._tool_call_manager._flush_to_message(session_id, persona)
+                return RequestPermissionResponse(
+                    outcome=DeniedOutcome(outcome="cancelled")
+                )
+            
+            tc.permission_status = "resolved"
+            tc.selected_option_id = selected_option_id
+            self._tool_call_manager._flush_to_message(session_id, persona)
+
+            return RequestPermissionResponse(
+                outcome=AllowedOutcome(option_id=selected_option_id, outcome='selected')
+            )
+        except Exception as e:
+            persona.log.error(f"request_permission FAILED: {e}\n{tb_mod.format_exc()}")
+            raise
 
     async def write_text_file(
         self, content: str, path: str, session_id: str, **kwargs: Any
@@ -360,9 +638,82 @@ class JaiAcpClient(Client):
             **kwargs,
         )
 
+    async def end_session(self, session_id: str) -> None:
+        """
+        Clean up all resources for a completed session.
+
+        Releases all terminals, clears tool call state, and removes the
+        session from the persona and lock registries.
+        """
+        try:
+            await self._terminal_manager.cleanup_session(session_id)
+        except Exception:
+            log.warning(
+                "Failed to cleanup terminals for session %s",
+                session_id,
+                exc_info=True,
+            )
+        self._tool_call_manager.cleanup(session_id)
+        self._personas_by_session.pop(session_id, None)
+        self._prompt_locks_by_session.pop(session_id, None)
+        self._loading_sessions.pop(session_id, None)
+
     async def ext_method(self, method: str, params: dict) -> dict:
         raise RequestError.method_not_found(method)
 
     async def ext_notification(self, method: str, params: dict) -> None:
         raise RequestError.method_not_found(method)
+
+    async def stop_streaming(self, session_id: str) -> None:
+        """Cancel an in-progress prompt for the given session."""
+        persona = self._personas_by_session.get(session_id)
+        if persona is None:
+            raise RuntimeError(
+                f"stop_streaming called without an initialized session: {session_id}"
+            )
+
+        self._cancel_requested[session_id] = True
+
+        # Notify the ACP agent to stop
+        try:
+            conn = await self.get_connection()
+            await conn.cancel(session_id)
+        except Exception:
+            persona.log.warning(f"stop_streaming: failed to send cancel for session {session_id}")
+
+        # Finalize the partial message as-is
+        message_id = self._tool_call_manager.get_message_id(session_id)
+        if message_id:
+            msg = persona.ychat.get_message(message_id)
+            if msg:
+                persona.ychat.update_message(msg, append=False, trigger_actions=[find_mentions])
+
+        # Reset awareness
+        persona.awareness.set_local_state_field("isWriting", False)
+
+        self._cancel_pending_work(session_id)
+
+    def _cancel_pending_work(self, session_id: str) -> None:
+        """Mark non-finished tool calls as failed, reject pending permissions, and flush."""
+        persona = self._personas_by_session.get(session_id)
+
+        # Mark non-finished tool calls as failed
+        session_state = self._tool_call_manager._sessions.get(session_id)
+        if session_state:
+            for tc in session_state.tool_calls.values():
+                if tc.status not in ("completed", "failed"):
+                    tc.status = "failed"
+
+        # Cancel pending permissions
+        rejected = self._permission_manager.cancel_all_pending(session_id)
+        if rejected and persona:
+            persona.log.info(
+                f"_cancel_pending_work: auto-rejected {rejected} pending permission(s) for session {session_id}"
+            )
+
+        # Flush updated state to frontend
+        if persona:
+            self._tool_call_manager._flush_to_message(session_id, persona)
+
+
 
