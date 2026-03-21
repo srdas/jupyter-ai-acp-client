@@ -1,6 +1,8 @@
 import React from 'react';
 import { IToolCallDiff } from '@jupyter/chat';
+import { PathExt } from '@jupyterlab/coreutils';
 import { structuredPatch } from 'diff';
+import clsx from 'clsx';
 
 /** Maximum number of diff lines shown before truncation. */
 const MAX_DIFF_LINES = 20;
@@ -19,10 +21,14 @@ interface IDiffLineInfo {
  */
 function DiffBlock({
   diff,
-  onOpenFile
+  onOpenFile,
+  toDisplayPath,
+  pendingPermission
 }: {
   diff: IToolCallDiff;
   onOpenFile?: (path: string) => void;
+  toDisplayPath?: (path: string) => string;
+  pendingPermission?: boolean;
 }): JSX.Element {
   const patch = structuredPatch(
     diff.path,
@@ -33,7 +39,16 @@ function DiffBlock({
     undefined,
     { context: Infinity }
   );
-  const filename = diff.path.split('/').pop() ?? diff.path;
+  const displayPath = toDisplayPath
+    ? toDisplayPath(diff.path)
+    : PathExt.basename(diff.path);
+  // toDisplayPath makes paths inside the server root relative. A leading '/'
+  // means the file is outside it and cannot be opened via the Contents API.
+  const isOutsideRoot = displayPath.startsWith('/');
+  const isClickable =
+    !!onOpenFile &&
+    !isOutsideRoot &&
+    !(pendingPermission && diff.old_text === undefined);
   const [expanded, setExpanded] = React.useState(false);
 
   // Flatten hunks into renderable lines
@@ -67,11 +82,13 @@ function DiffBlock({
   return (
     <div className="jp-jupyter-ai-acp-client-diff-block">
       <div
-        className="jp-jupyter-ai-acp-client-diff-header"
-        onClick={onOpenFile ? () => onOpenFile(diff.path) : undefined}
+        className={clsx('jp-jupyter-ai-acp-client-diff-header', {
+          'jp-jupyter-ai-acp-client-diff-header-clickable': isClickable
+        })}
+        onClick={isClickable ? () => onOpenFile!(diff.path) : undefined}
         title={diff.path}
       >
-        {filename}
+        {displayPath}
       </div>
       <div className="jp-jupyter-ai-acp-client-diff-content">
         {visible.map((line: IDiffLineInfo) => (
@@ -110,15 +127,25 @@ function DiffBlock({
  */
 export function DiffView({
   diffs,
-  onOpenFile
+  onOpenFile,
+  toDisplayPath,
+  pendingPermission
 }: {
   diffs: IToolCallDiff[];
   onOpenFile?: (path: string) => void;
+  toDisplayPath?: (path: string) => string;
+  pendingPermission?: boolean;
 }): JSX.Element {
   return (
     <div className="jp-jupyter-ai-acp-client-diff-container">
       {diffs.map((d, i) => (
-        <DiffBlock key={i} diff={d} onOpenFile={onOpenFile} />
+        <DiffBlock
+          key={i}
+          diff={d}
+          onOpenFile={onOpenFile}
+          toDisplayPath={toDisplayPath}
+          pendingPermission={pendingPermission}
+        />
       ))}
     </div>
   );
