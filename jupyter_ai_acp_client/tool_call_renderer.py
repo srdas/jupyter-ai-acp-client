@@ -116,6 +116,8 @@ def update_tool_call_from_start(
     Apply a ToolCallStart event to the tool calls dict.
 
     Creates a new ToolCallState with status 'in_progress'.
+    Merges into an existing ToolCallState if one already exists (e.g. from a
+    prior start or request_permission), preserving permission-related fields.
     Generates a title from kind/locations if the agent sends an empty title.
     """
     if not title and (kind or locations):
@@ -124,6 +126,19 @@ def update_tool_call_from_start(
         title = "Working..."
     else:
         title = _shorten_title(title)
+
+    if tool_call_id in tool_calls:
+        tc = tool_calls[tool_call_id]
+        tc.title = title
+        if kind is not None:
+            tc.kind = kind
+        if locations is not None:
+            tc.locations = locations
+        if diffs is not None:
+            tc.diffs = diffs
+        if raw_input is not None:
+            tc.raw_input = raw_input
+        return
 
     tool_calls[tool_call_id] = ToolCallState(
         tool_call_id=tool_call_id,
