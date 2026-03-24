@@ -47,8 +47,8 @@ try:
     version_str = version_match.group(1)
     version_parts = [int(x) for x in version_str.split('.')]
 
-    # Check if version >= 0.1.13
-    required_version = (0, 1, 13)
+    # Check if version >= 0.34.0
+    required_version = (0, 34, 0)
     current_version = tuple(version_parts)
 
     if current_version < required_version:
