@@ -2,7 +2,7 @@ import asyncio
 import sys
 from asyncio import Task
 from asyncio.subprocess import Process
-from typing import Any, Awaitable, ClassVar, Optional
+from typing import Any, ClassVar, Optional
 
 from acp import NewSessionResponse, LoadSessionResponse
 from acp.schema import AvailableCommand
@@ -11,6 +11,7 @@ from jupyterlab_chat.models import Message
 
 from .default_acp_client import JaiAcpClient
 from .telemetry import emit_event, auto_emit_event
+
 
 class BaseAcpPersona(BasePersona):
     _before_subprocess_future: ClassVar[Task[None] | None] = None
@@ -21,16 +22,16 @@ class BaseAcpPersona(BasePersona):
     `self.before_agent_subprocess()` - see method documentation for details.
     """
 
-    _subprocess_future: ClassVar[Awaitable[Process] | None] = None
+    _subprocess_future: ClassVar[Task[Process] | None] = None
     """
     The task that yields the agent subprocess once complete. This is a class
     attribute because multiple instances of the same ACP persona may share an
     ACP agent subprocess.
-    
+
     Developers should always use `self.get_agent_subprocess()`.
     """
 
-    _client_future: ClassVar[Awaitable[JaiAcpClient] | None] = None
+    _client_future: ClassVar[Task[JaiAcpClient] | None] = None
     """
     The future that yields the ACP Client once complete. This is a class
     attribute because multiple instances of the same ACP persona may share an
@@ -39,7 +40,7 @@ class BaseAcpPersona(BasePersona):
     Developers should always use `self.get_client()`.
     """
 
-    _client_session_future: Awaitable[NewSessionResponse | LoadSessionResponse]
+    _client_session_future: Task[NewSessionResponse | LoadSessionResponse]
     """
     The future that yields the ACP client session info. Each instance of an ACP
     persona has a unique session ID, i.e. each chat reserves a unique session.
@@ -60,15 +61,24 @@ class BaseAcpPersona(BasePersona):
 
         # Ensure each subclass has its own subprocess and client by checking if the
         # class variable is defined directly on this class (not inherited)
-        if '_before_subprocess_future' not in self.__class__.__dict__ or self.__class__._before_subprocess_future is None:
+        if (
+            "_before_subprocess_future" not in self.__class__.__dict__
+            or self.__class__._before_subprocess_future is None
+        ):
             self.__class__._before_subprocess_future = self.event_loop.create_task(
                 self.before_agent_subprocess()
             )
-        if '_subprocess_future' not in self.__class__.__dict__ or self.__class__._subprocess_future is None:
+        if (
+            "_subprocess_future" not in self.__class__.__dict__
+            or self.__class__._subprocess_future is None
+        ):
             self.__class__._subprocess_future = self.event_loop.create_task(
                 self._init_agent_subprocess()
             )
-        if '_client_future' not in self.__class__.__dict__ or self.__class__._client_future is None:
+        if (
+            "_client_future" not in self.__class__.__dict__
+            or self.__class__._client_future is None
+        ):
             self.__class__._client_future = self.event_loop.create_task(
                 self._init_client()
             )
@@ -86,11 +96,13 @@ class BaseAcpPersona(BasePersona):
 
         The `BaseAcpPersona` does not implement this method by default.
         Subclasses are expected to provide a custom implementation of this
-        method if required. 
+        method if required.
         """
         return None
 
-    async def _init_agent_subprocess(self, env: Optional[dict[str, str]] = None) -> Process:
+    async def _init_agent_subprocess(
+        self, env: Optional[dict[str, str]] = None
+    ) -> Process:
         # Wait until user is authenticated
         await self._before_subprocess_future
         kwargs: dict[str, Any] = dict(
@@ -108,11 +120,12 @@ class BaseAcpPersona(BasePersona):
     @auto_emit_event("acp_server_init")
     async def _init_client(self) -> JaiAcpClient:
         agent_subprocess = await self.get_agent_subprocess()
-        client = JaiAcpClient(agent_subprocess=agent_subprocess, event_loop=self.event_loop)
+        client = JaiAcpClient(
+            agent_subprocess=agent_subprocess, event_loop=self.event_loop
+        )
         self.log.info("Initialized ACP client for '%s'.", self.__class__.__name__)
         return client
 
-    
     def _get_existing_sessions(self) -> dict[str, str]:
         """
         Returns a dictionary of existing ACP session IDs within this instance's
@@ -123,7 +136,7 @@ class BaseAcpPersona(BasePersona):
         """
         sessions = self.ychat.get_metadata().get("acp_session_ids", {})
         return sessions
-    
+
     def _record_new_session(self, new_session_id: str) -> None:
         """
         Adds a new ACP session ID into this chat's metadata. Always use this
@@ -138,7 +151,9 @@ class BaseAcpPersona(BasePersona):
 
     @auto_emit_event("acp_session_init", lambda self: {"session_operation": "load"})
     async def _load_session(self, client, existing_session_id) -> LoadSessionResponse:
-        response = await client.load_session(persona=self, session_id=existing_session_id)
+        response = await client.load_session(
+            persona=self, session_id=existing_session_id
+        )
         self.log.info(
             "Loaded existing ACP client session for '%s' with ID '%s'.",
             self.__class__.__name__,
@@ -175,19 +190,19 @@ class BaseAcpPersona(BasePersona):
         Safely returns the ACP agent subprocess for this persona.
         """
         return await self.__class__._subprocess_future
-    
+
     async def get_client(self) -> JaiAcpClient:
         """
         Safely returns the ACP client for this persona.
         """
         return await self.__class__._client_future
-    
+
     async def get_session_response(self) -> NewSessionResponse | LoadSessionResponse:
         """
         Safely returns the ACP session response for this chat.
         """
         return await self._client_session_future
-    
+
     async def get_session_id(self) -> str:
         """
         Safely returns the ACP session ID assigned to this chat.
@@ -195,17 +210,17 @@ class BaseAcpPersona(BasePersona):
         await self._client_session_future
         # session ID should always be stored in chat metadata after client
         # session was created or loaded.
-        session_ids =  self._get_existing_sessions()
+        session_ids = self._get_existing_sessions()
         assert self.id in session_ids
         return session_ids[self.id]
-    
+
     async def is_authed(self) -> bool:
         """
         Returns whether the client is authenticated to use this agent. Returns
         `True` by default. Subclasses should override this if possible.
         """
         return True
-    
+
     async def handle_no_auth(self, message: Message) -> None:
         """
         Method called when the persona receives a message while the user is not
@@ -252,7 +267,7 @@ class BaseAcpPersona(BasePersona):
             attachments=attachments,
             root_dir=self.parent.root_dir,
         )
-    
+
     @property
     def acp_slash_commands(self) -> list[AvailableCommand]:
         """
@@ -264,7 +279,7 @@ class BaseAcpPersona(BasePersona):
         `AvailableCommandsUpdate` payload from the ACP agent.
         """
         return self._acp_slash_commands
-    
+
     @acp_slash_commands.setter
     def acp_slash_commands(self, commands: list[AvailableCommand]):
         self.log.info(
@@ -275,52 +290,93 @@ class BaseAcpPersona(BasePersona):
         )
         self._acp_slash_commands = commands
 
-    def shutdown(self):
-        # TODO: allow shutdown() to be async
-        if getattr(self, '_shutting_down', False):
+    async def shutdown(self):
+        if getattr(self, "_shutting_down", False):
             return
         self._shutting_down = True
-        self.event_loop.create_task(self._shutdown())
+        await super().shutdown()
+        await self._shutdown()
 
     async def _shutdown(self):
-        self.log.info("Closing ACP agent and client for '%s'.", self.__class__.__name__)
-        client = await self.get_client()
+        self.log.debug("[shutdown] Starting for '%s'.", self.__class__.__name__)
+
+        # Cancel any pending startup futures to avoid hanging on auth-gated
+        # personas (e.g. Kiro, Gemini) that never finished startup.
+        for future in [
+            self.__class__._before_subprocess_future,
+            self.__class__._subprocess_future,
+            self.__class__._client_future,
+            self._client_session_future,
+        ]:
+            if isinstance(future, Task) and not future.done():
+                future.cancel()
+
+        # Step 1: Session cleanup
         try:
+            client = await self.get_client()
             session_id = await self.get_session_id()
             await client.end_session(session_id)
+            self.log.debug(
+                "[shutdown] Step 1: session ended for '%s'.",
+                self.__class__.__name__,
+            )
+        except asyncio.CancelledError:
+            pass
         except Exception:
-            self.log.warning(
-                "Failed to clean up session resources during shutdown for '%s'.",
+            self.log.debug(
+                "[shutdown] Step 1: failed for '%s'.",
                 self.__class__.__name__,
                 exc_info=True,
             )
+
+        # Step 2: Close connection
         try:
+            client = await self.get_client()
             conn = await client.get_connection()
             await conn.close()
+            self.log.debug(
+                "[shutdown] Step 2: connection closed for '%s'.",
+                self.__class__.__name__,
+            )
+        except asyncio.CancelledError:
+            pass
         except Exception:
-            self.log.warning(
-                "Failed to close connection during shutdown for '%s'.",
+            self.log.debug(
+                "[shutdown] Step 2: failed for '%s'.",
                 self.__class__.__name__,
                 exc_info=True,
             )
+
+        # Step 3: Kill the subprocess
         try:
             subprocess = await self.get_agent_subprocess()
             subprocess.kill()
-        except (ProcessLookupError, PermissionError, OSError):
+            self.log.debug(
+                "[shutdown] Step 3: subprocess killed for '%s'.",
+                self.__class__.__name__,
+            )
+        except asyncio.CancelledError:
             pass
+        except (ProcessLookupError, PermissionError, OSError):
+            self.log.debug(
+                "[shutdown] Step 3: subprocess already dead for '%s'.",
+                self.__class__.__name__,
+            )
         except Exception:
-            self.log.warning(
-                "Failed to kill subprocess during shutdown for '%s'.",
+            self.log.debug(
+                "[shutdown] Step 3: failed for '%s'.",
                 self.__class__.__name__,
                 exc_info=True,
             )
-        self.log.info("Successfully closed ACP agent and client for '%s'.", self.__class__.__name__)
+
+        self.log.debug("[shutdown] Complete for '%s'.", self.__class__.__name__)
 
     @property
     def event_logger(self):
         """Return the Jupyter EventLogger, or None if unavailable."""
         try:
             from jupyter_events import EventLogger
+
             extension_app = self.parent.parent  # ExtensionApp instance
             event_logger: EventLogger = extension_app.serverapp.event_logger
             return event_logger
