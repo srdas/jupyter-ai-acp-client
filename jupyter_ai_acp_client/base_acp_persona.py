@@ -1,4 +1,6 @@
 import asyncio
+import os
+import signal
 import sys
 from asyncio import Task
 from asyncio.subprocess import Process
@@ -105,11 +107,13 @@ class BaseAcpPersona(BasePersona):
     ) -> Process:
         # Wait until user is authenticated
         await self._before_subprocess_future
+        self.log.info("Spawning ACP agent subprocess for '%s'.", self.__class__.__name__)
         kwargs: dict[str, Any] = dict(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=sys.stderr,
             limit=50 * 1024 * 1024,
+            start_new_session=True,
         )
         if env is not None:
             kwargs["env"] = env
@@ -151,15 +155,19 @@ class BaseAcpPersona(BasePersona):
 
     @auto_emit_event("acp_session_init", lambda self: {"session_operation": "load"})
     async def _load_session(self, client, existing_session_id) -> LoadSessionResponse:
-        response = await client.load_session(
-            persona=self, session_id=existing_session_id
-        )
-        self.log.info(
-            "Loaded existing ACP client session for '%s' with ID '%s'.",
-            self.__class__.__name__,
-            existing_session_id,
-        )
-        return response
+        try:
+            response = await client.load_session(
+                persona=self, session_id=existing_session_id
+            )
+            self.log.info(
+                "Loaded existing ACP client session for '%s' with ID '%s'.",
+                self.__class__.__name__,
+                existing_session_id,
+            )
+            return response
+        except:
+            self.log.exception("Failed to load client session for %s with ID %s", self.__class__.__name__, existing_session_id)
+            raise
 
     @auto_emit_event("acp_session_init", lambda self: {"session_operation": "new"})
     async def _create_session(self, client) -> NewSessionResponse:
@@ -298,7 +306,7 @@ class BaseAcpPersona(BasePersona):
         await self._shutdown()
 
     async def _shutdown(self):
-        self.log.debug("[shutdown] Starting for '%s'.", self.__class__.__name__)
+        self.log.info("[shutdown] Starting for '%s'.", self.__class__.__name__)
 
         # Cancel any pending startup futures to avoid hanging on auth-gated
         # personas (e.g. Kiro, Gemini) that never finished startup.
@@ -316,60 +324,88 @@ class BaseAcpPersona(BasePersona):
             client = await self.get_client()
             session_id = await self.get_session_id()
             await client.end_session(session_id)
-            self.log.debug(
+            self.log.info(
                 "[shutdown] Step 1: session ended for '%s'.",
                 self.__class__.__name__,
             )
         except asyncio.CancelledError:
             pass
         except Exception:
-            self.log.debug(
+            self.log.warning(
                 "[shutdown] Step 1: failed for '%s'.",
                 self.__class__.__name__,
                 exc_info=True,
             )
+
+        # Skip connection/subprocess teardown if other sessions are still active
+        try:
+            client = await self.get_client()
+            if client.list_sessions():
+                self.log.info(
+                    "[shutdown] Other sessions still active, skipping subprocess teardown for '%s'.",
+                    self.__class__.__name__,
+                )
+                return
+        except (asyncio.CancelledError, Exception):
+            pass
 
         # Step 2: Close connection
         try:
             client = await self.get_client()
             conn = await client.get_connection()
             await conn.close()
-            self.log.debug(
+            self.log.info(
                 "[shutdown] Step 2: connection closed for '%s'.",
                 self.__class__.__name__,
             )
         except asyncio.CancelledError:
             pass
         except Exception:
-            self.log.debug(
+            self.log.warning(
                 "[shutdown] Step 2: failed for '%s'.",
                 self.__class__.__name__,
                 exc_info=True,
             )
 
-        # Step 3: Kill the subprocess
+        # Step 3: Stop the subprocess gracefully, falling back to SIGKILL
         try:
             subprocess = await self.get_agent_subprocess()
-            subprocess.kill()
-            self.log.debug(
-                "[shutdown] Step 3: subprocess killed for '%s'.",
-                self.__class__.__name__,
-            )
+            pgid = os.getpgid(subprocess.pid)
+            os.killpg(pgid, signal.SIGINT)
+            os.killpg(pgid, signal.SIGTERM)
+            try:
+                await asyncio.wait_for(subprocess.wait(), timeout=5.0)
+                self.log.info(
+                    "[shutdown] Step 3: subprocess terminated for '%s'.",
+                    self.__class__.__name__,
+                )
+            except asyncio.TimeoutError:
+                os.killpg(pgid, signal.SIGKILL)
+                self.log.info(
+                    "[shutdown] Step 3: subprocess killed after timeout for '%s'.",
+                    self.__class__.__name__,
+                )
         except asyncio.CancelledError:
             pass
         except (ProcessLookupError, PermissionError, OSError):
-            self.log.debug(
+            self.log.info(
                 "[shutdown] Step 3: subprocess already dead for '%s'.",
                 self.__class__.__name__,
             )
         except Exception:
-            self.log.debug(
+            self.log.warning(
                 "[shutdown] Step 3: failed for '%s'.",
                 self.__class__.__name__,
                 exc_info=True,
             )
 
-        self.log.debug("[shutdown] Complete for '%s'.", self.__class__.__name__)
+        # Reset class attributes to `None` after cleaning up the global
+        # resources they store
+        self.__class__._before_subprocess_future = None
+        self.__class__._subprocess_future = None
+        self.__class__._client_future = None
+
+        self.log.info("[shutdown] Complete for '%s'.", self.__class__.__name__)
 
     @property
     def event_logger(self):
